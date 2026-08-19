@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Project
+# NB: data/ is deliberately NOT ignored — the ~1 MB training CSV is committed so
+# the Docker build is hermetic. See PLAN.md "On committing the CSV".
+artifacts/
+.env
+
+# Tooling
+.aws-sam/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

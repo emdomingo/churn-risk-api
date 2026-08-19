@@ -1,0 +1,46 @@
+[project]
+name = "churn"
+version = "0.1.0"
+description = "Churn-risk scoring microservice with SHAP explanations and next-best-action"
+readme = "README.md"
+authors = [
+    { name = "emdomingo", email = "domingo.edwardjohn@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.122.0",
+    "fastapi>=0.141.1",
+    "mangum>=0.21.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.5",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "scikit-learn>=1.9.0",
+    "shap>=0.51.0",
+    "xgboost>=3.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.3",
+]
+train = [
+    "matplotlib>=3.11.1",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
