@@ -7,6 +7,12 @@ retention action) deployed as a container-image Lambda behind API Gateway, with
 GitHub Actions CI/CD. The repo is currently **empty** — `main` exists with zero
 commits and only `SPEC.md` untracked.
 
+**Status (S3 complete).** S0-S3 are done: `data.py`, `features.py`, `train.py`,
+`artifact.py`, `scoring.py`, `explain.py`, and the notebook, with 77 tests green and
+ruff clean. All five decision gates below are resolved. S4 (contracts + API) is next.
+The "repo is currently empty" line above describes the state this plan was written in,
+not the state today.
+
 This plan covers what the SPEC deliberately leaves open: how to initialise the
 project, and how to cut the work into scaffolds that each end at a runnable,
 testable state. The SPEC's §11 guardrail ("surface tradeoffs, don't silently
@@ -142,6 +148,15 @@ runs in seconds with **no committed artifact and no network** — this is what k
 `ci.yml` AWS-free.
 *Done when:* scores are in [0,1], band boundaries are tested at their edges, and
 drivers come back with correct signs on a known-risky record.
+**Done (S3).** All three met, 38 tests across `test_scoring.py` / `test_explain.py`.
+Two shapes worth knowing before S4 wraps them in Pydantic: `score` is batch-first
+(`score_one` is a one-line convenience over it) and `explain` *rejects* a batch rather
+than silently explaining row 0. `select_drivers` takes a Series rather than a record so
+the selection policy is testable with no model involved; it ranks by magnitude, keeps
+the sign, and applies a noise floor **relative to each customer's own strongest driver**
+(5%), returning fewer than `top_n` rather than padding the list with a contribution
+`/recommend` would then have to justify. On the current test split that floor never
+fires — it is a guard, not a filter.
 
 ### Night 2 — service + agent + container
 
@@ -199,18 +214,40 @@ test hittable against the live URL.
 1. **`TotalCharges` blanks** (~11 rows, all `tenure == 0`). Impute 0, impute
    `MonthlyCharges`, or drop? These are brand-new customers, so the choice is
    substantive. → S1.
+   **Resolved (S1):** filled with **0.0** — the semantically correct amount for a
+   customer billed for zero months, not an estimate. Keeps `tenure == 0` customers
+   scoreable, which matters because they are a real retention target at inference.
 2. **SHAP explains the *uncalibrated* margin.** `CalibratedClassifierCV` wraps
    the booster, and `TreeExplainer` runs on the booster underneath. So the
    returned *score* is calibrated while the *drivers* explain the pre-calibration
    margin. This is defensible (calibration is a monotone map, so the ranking of
    drivers is unchanged) but it must be stated in the README, not glossed. → S2/S3.
+   **Resolved (S2/S3):** accepted as designed and documented at the top of both
+   `train.py` and `explain.py`. Contributions are reported in **margin units**, so they
+   do not sum to the probability; `test_contributions_reconstruct_the_margin` pins the
+   additivity against the booster. Still owed a paragraph in the README.
 3. **Driver naming after one-hot encoding.** Report level-specific names
    (`Contract=Month-to-month`) or aggregate contributions back to the original
    column (`Contract`)? Level-specific is more actionable for `/recommend`. → S3.
+   **Resolved (S3): level-specific.** `/explain` returns `Contract=Month-to-month`;
+   aggregating to `Contract` would leave `/recommend` unable to tell whether a
+   contract-term incentive is the right offer or a pointless one. The name is
+   reconstructed from the fitted `OneHotEncoder.categories_`, not by splitting the
+   encoded name, so a column containing the separator cannot corrupt it.
 4. **Risk-band thresholds.** Proposed starting point low <0.30 / med / high >0.60,
    but pick from the PR curve once S2's metrics exist. → S3.
+   **Resolved (S3): low < 0.167 / medium / high >= 0.50**, not the proposed 0.30/0.60.
+   The low cut *is* the cost-derived operating threshold from gate #5, so "band is not
+   low" and "the model says intervene" are the same predicate and the confusion matrix
+   in the metrics table describes exactly the medium+high population;
+   `test_low_band_cut_is_the_cost_derived_operating_threshold` enforces that. The high
+   cut comes off the test-split precision curve: at 0.50 the high band is 23% of
+   customers and 63% of them churn, against a 26.5% base rate.
 5. **Confusion-matrix threshold** — a business call (recall on churners vs.
    retention-offer cost), not a default. → S2.
+   **Resolved (S2): derived, not picked.** `MISSED_CHURNER_COST_RATIO = 5.0` (missing a
+   churner costs 5x a wasted retention offer) gives `1 / (1 + 5)` = **0.167** for a
+   calibrated score. The number to argue with is the cost ratio, not the threshold.
 
 ## Verification
 
