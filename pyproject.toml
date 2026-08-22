@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.122.0",
     "fastapi>=0.141.1",
+    "joblib>=1.5.3",
     "mangum>=0.21.0",
     "numpy>=2.4.6",
     "pandas>=3.0.5",
@@ -27,6 +28,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "ipykernel>=7.3.0",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.3",
