@@ -32,3 +32,32 @@ def tiny_artifact(sample_frame: pd.DataFrame) -> ChurnArtifact:
     """A real artifact trained on the fixture. Too small to be accurate; that is fine —
     every test here is about wiring and contracts, never about model quality."""
     return build_artifact(sample_frame, model_version="test-artifact")
+
+
+@pytest.fixture(scope="session")
+def raw_rows() -> list[dict]:
+    """Fixture rows exactly as the CSV holds them -- blanks, 0/1 SeniorCitizen and all.
+
+    Uncleaned on purpose: `schemas` claims a raw CSV row is a valid request body, and a
+    cleaned frame would not test that claim.
+    """
+    frame = pd.read_csv(FIXTURE).drop(columns=["Churn"])
+    return frame.to_dict("records")
+
+
+@pytest.fixture
+def client(tiny_artifact: ChurnArtifact):
+    """A `TestClient` wired to the fixture artifact.
+
+    Overriding the dependency rather than the loader keeps the substitution at the seam
+    the app already declares -- no import patching, no artifact on disk, and the same
+    mechanism S5 will use for the Anthropic client.
+    """
+    from fastapi.testclient import TestClient
+
+    from churn.api import app, artifact_dependency
+
+    app.dependency_overrides[artifact_dependency] = lambda: tiny_artifact
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
