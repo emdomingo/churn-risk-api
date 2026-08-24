@@ -50,6 +50,19 @@ Parameters:
       the route degrades to action: null with a reason, exactly as it does when the API is
       down. NoEcho keeps it out of console and CLI output.
 
+  MemorySize:
+    Type: Number
+    Default: 3008
+    Description: >
+      Not headroom -- measured peak is 341MB. Lambda scales vCPU and IO bandwidth with
+      memory, and this function's cold start is dominated by importing pandas, sklearn,
+      shap and xgboost off a streamed container image. 1769MB (one vCPU) was tried first
+      and the init phase overran Lambda's 10s limit; see the S8 gate in PLAN.md.
+      Parameterised so the number can be tuned against INIT_REPORT without editing the
+      template. 3008MB is what is deployed: it does not fix the cold start -- nothing
+      short of restructuring the edge does -- but it cut the suppressed-init invocation
+      from 27.1s to 20.5s. See gate 10 in PLAN.md.
+
   LogLevel:
     Type: String
     Default: INFO
@@ -66,15 +79,11 @@ Parameters:
 
 Globals:
   Function:
-    # Measured, not guessed: peak RSS after loading the artifact is 283 MiB, so this is not
-    # about memory headroom at all. Lambda scales vCPU with memory and reaches one full
-    # vCPU at 1769MB; the ~6s init is single-threaded import work (pandas, sklearn,
-    # xgboost, shap) plus the joblib load, so anything less stretches it proportionally.
-    # An init over 10s is suppressed and re-run inside the invocation, which turns a slow
-    # cold start into a much slower one — that cliff is what this number buys distance
-    # from, and duration billing means faster-and-bigger costs about the same as
-    # slower-and-smaller.
-    MemorySize: 1769
+    # See the MemorySize parameter: this buys CPU and IO bandwidth for the cold start, not
+    # room for the model. Duration billing means faster-and-bigger costs roughly the same
+    # as slower-and-smaller, so the only real question is which side of Lambda's 10s init
+    # limit the function lands on.
+    MemorySize: !Ref MemorySize
 
     # API Gateway HTTP API integrations time out at 29s no matter what Lambda permits, so
     # matching it makes the two limits one number. recommend.py budgets against this:

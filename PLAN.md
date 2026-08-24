@@ -274,6 +274,85 @@ test hittable against the live URL.
    `uv.lock` is untouched, so the image is a deliberate *subset* of the resolution rather
    than a different one. Result: **1.28GB**, and 326MB less downloaded per build.
 
+### Raised and resolved during S8
+
+8. **Lambda memory and timeout.** PLAN pencilled 1536MB and ~30s before anything ran.
+   **Resolved (S8): 3008MB and 29s.** Memory is not headroom — measured peak is 341MB of
+   whatever is allocated. It buys vCPU and IO bandwidth for the cold start, and duration
+   billing means faster-and-bigger costs about the same as slower-and-smaller. 1769MB (one
+   vCPU) was deployed first and measured; see gate 10. The timeout is 29s because that is
+   API Gateway's HTTP API integration ceiling — anything above it is unreachable through
+   the API, so matching makes the two limits one number. `recommend.py`'s comments were
+   realigned from 30s to 29s.
+
+9. **Log retention and public exposure.**
+   **Resolved (S8): 14 days, and stage throttling at 5 rps / burst 10.** CloudWatch
+   defaults to Never Expire, which is how a $0 project grows a bill. The URL is public and
+   unauthenticated as SPEC intends — a demo anyone can curl is the point — but `/recommend`
+   spends Anthropic credits per call, so every route is rate limited at the stage.
+   Throttled requests are refused by API Gateway before Lambda is invoked, costing neither
+   function time nor tokens. This bounds abuse rather than preventing it, which is the
+   right trade for a portfolio endpoint.
+
+10. **The cold start does not fit the init phase.** Measured on the deployed function:
+
+    ```
+    INIT_REPORT  Init Duration: 10006.25 ms  Status: timeout   (at 1769MB)
+    INIT_REPORT  Init Duration:  9997.64 ms  Status: timeout   (at 3008MB)
+    REPORT       Duration: 27098 ms  Memory 1769 MB  Max Used 341 MB
+    REPORT       Duration: 20487 ms  Memory 3008 MB  Max Used 330 MB
+    ```
+
+    Lambda caps the init phase at 10s. Over that, it *suppresses* init and re-runs the
+    whole thing inside the invocation, so the wasted 10s is added to the real work: 10 +
+    20.5 = 30.5s, past API Gateway's 29s. **The first request after a deploy therefore
+    returns 503; every request after it is 70–160ms.**
+
+    Where the ~20s goes — measured inside the image, local CPU:
+
+    | step | local |
+    |---|---|
+    | `import pandas` | 1.06s |
+    | `import sklearn` | 1.40s |
+    | `import shap` (pulls numba/llvmlite) | 0.47s |
+    | `import anthropic` | 0.56s |
+    | `import fastapi` + `mangum` | 0.23s |
+    | `import xgboost` | 0.03s |
+    | `joblib.load(model.joblib)` | **0.08s** |
+    | total | 3.83s (≈20s on Lambda) |
+
+    3.83s of local CPU becoming ~20s on Lambda means the cost is first-touch IO against a
+    lazily streamed 1.49GB image, not compute — which is also why doubling memory bought
+    only 6.6s. **The artifact load is irrelevant at 0.08s**, so "lazy-load the model" would
+    buy nothing.
+
+    Three levers were measured before accepting the behaviour:
+
+    - **Precompiled bytecode — applied.** A Lambda filesystem is read-only, so Python can
+      never cache bytecode at runtime; the image shipped without `.pyc` and recompiled the
+      whole dependency tree on every cold start. 8.53s uncached against 2.40s cached;
+      fresh-container init 6.0s → 4.1s. Costs ~150MB. This is in the Dockerfile.
+    - **Tiered laziness (defer SHAP only) — rejected on measurement.** The score path
+      without `shap` is 2.84s of the 3.67s total, so deferring SHAP leaves ~78% of the
+      cost, ~15.5s on Lambda, still over the cap. It is also blocked by design: the
+      artifact pickle *contains* a `TreeExplainer`, so `joblib.load` imports `shap`
+      transitively — deleting `numba` from a built image breaks artifact loading outright.
+      Splitting the artifact would undo the one-file no-drift property.
+    - **Further image trimming — rejected on measurement.** Stripping every `.so` saves
+      75MB of 853MB; dropping `.py` files that duplicate a `.pyc` would add 111MB but
+      breaks tracebacks and any library that reads its own source. Best case ~1.3GB. The
+      bulk is irreducible binary: xgboost 228MB, llvmlite 173MB, scipy 113MB. S6 had
+      already taken the easy 454MB by filtering `nvidia-`.
+
+    **Resolved (S8): accepted and documented, not worked around.** The remaining fix would
+    be to defer the heavy imports out of module scope so the init phase stays trivial and
+    the ~20s lands inside the 29s invocation budget — which converts the 503 into a slow
+    200. That inverts the "artifact loads at import so it lands in the init phase"
+    decision in `SPEC.md` §6, and the owner chose to document the behaviour rather than
+    restructure the edge for it. A warmer (EventBridge pinging `/health`) and provisioned
+    concurrency (~$19–32/month) were both rejected — the first papers over the cause, the
+    second ends the free-tier story.
+
 ## Verification
 
 - **Per scaffold:** `uv run pytest` green, `uv run ruff check` clean.

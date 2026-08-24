@@ -120,8 +120,10 @@ init phase.
 
 ## Current state
 
-**S0–S6 complete.** 142 tests green, ruff clean. S4 and S5 are committed as
-`feat(contracts)` and `feat(api)`; S6 is the container work described below.
+**S0–S8 complete and deployed.** 142 tests green, ruff clean. The service is live at
+`https://03bmm97sm6.execute-api.ap-southeast-2.amazonaws.com` in account 033177020842,
+serving all four routes with `model_version` `0.1.0+3a40397`. **S9 (`ci.yml` and
+`deploy.yml`) is next**, then S10's README and smoke test.
 
 Built so far: `src/churn/data.py` (`load_raw` / `clean` / `split`), the committed
 `data/Telco-Customer-Churn.csv`, a 200-row fixture at `tests/fixtures/telco_sample.csv`
@@ -200,6 +202,34 @@ S6 decisions worth knowing before touching the `Dockerfile`:
   import side effects happen once per interpreter and the test session has long since
   imported `churn.api`.
 
-**S7 (bootstrap infra: GitHub OIDC provider, deploy role, ECR repo) is next**, followed
-by S8's SAM template. Both raise gates of their own — Lambda memory and timeout, log
-retention, and the trust policy's branch scoping.
+S7/S8 decisions worth knowing before touching `infra/bootstrap.yaml` or `template.yaml`:
+
+- **The deploy role holds exactly one IAM action**, `iam:PassRole`, conditioned on
+  `lambda.amazonaws.com`. That is why the Lambda *execution* role lives in
+  `bootstrap.yaml` rather than in `template.yaml`: creating it from CI would need
+  `iam:CreateRole` and `iam:AttachRolePolicy`, and a role that can mint roles can escalate
+  to anything. `template.yaml` takes the ARN as a parameter and creates no IAM at all.
+- **OIDC trust is `StringEquals` on the full subject**,
+  `repo:emdomingo/churn-risk-api:ref:refs/heads/main`. Forks and pull requests present a
+  different `sub` and are refused by STS, which is what makes the public repo safe to
+  deploy from. Renaming the repo breaks it and requires redeploying the bootstrap stack.
+- **ECR is IMMUTABLE and tags are commit SHAs.** A re-push of the same SHA is refused, so
+  fixing a bad image means deleting the tag first. Lifecycle keeps the last 3.
+- **`--provenance=false --sbom=false` is mandatory on every build.** Default buildx pushes
+  an OCI *image index* with an `unknown/unknown` attestation manifest, and Lambda rejects
+  that at `CreateFunction`. `deploy.yml` must carry both flags.
+- **`sam deploy` is not used; `aws cloudformation deploy` is.** SAM's packaging step
+  demands `--image-repository` and wants to build and push the image itself, which would
+  bypass the SHA tagging and the provenance flags. The image is built and pushed by an
+  explicit step, so the deploy is only a stack update — CloudFormation applies the SAM
+  transform server-side.
+- **The first request after a deploy returns 503.** This is known, measured, and
+  deliberately not worked around — see gate 10 in `PLAN.md`. Init exceeds Lambda's 10s
+  cap, gets suppressed and re-run inside the invocation, and 10 + 20.5s overruns API
+  Gateway's 29s. Every subsequent request is 70–160ms. S10's smoke test has to tolerate
+  it, and the README owes it an honest paragraph rather than a silent retry.
+
+**S9 (`ci.yml` + `deploy.yml`) is next**, then S10's README and smoke test. S9's own gates:
+whether CI runs the Docker build (slow, but it is the thing that breaks), and whether
+`deploy.yml` passes `ANTHROPIC_API_KEY` as a stack parameter on every deploy — the
+function currently runs without a key and `/recommend` degrades to `action: null`.
