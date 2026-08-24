@@ -33,7 +33,7 @@ AWS-free, and makes the "explain the request path" gate easy to answer.
 | IaC | AWS SAM (`template.yaml`) | One template for Lambda + HTTP API + IAM + logs; `sam local start-api` for local Lambda emulation |
 | Local Docker | Install Docker Desktop before Night 2 | Required to build/test the image and by `sam build` for container images |
 | Env/deps | `uv` + committed `uv.lock` | Already installed; lockfile satisfies the SPEC's "pin all versions" |
-| Python | 3.11 | Matches `public.ecr.aws/lambda/python:3.11`; matches local 3.11.11 |
+| Python | 3.11 | Matches local 3.11.11. **Revised (S6):** the AWS Lambda 3.11 base image proved unusable (AL2 glibc 2.26 vs xgboost's `manylinux_2_28` wheels); the Python version stands, the base image does not |
 | Training data | Commit the full CSV (~1 MB) | Hermetic build, no network on the deploy path, exact training bytes in the repo. **Deliberate exception to §2/§11** — see below |
 
 **On committing the CSV.** §2 and §11 say don't commit the full dataset. That
@@ -248,6 +248,31 @@ test hittable against the live URL.
    **Resolved (S2): derived, not picked.** `MISSED_CHURNER_COST_RATIO = 5.0` (missing a
    churner costs 5x a wasted retention offer) gives `1 / (1 + 5)` = **0.167** for a
    calibrated score. The number to argue with is the cost ratio, not the threshold.
+
+### Raised and resolved during S6
+
+6. **Lambda base image.** `public.ecr.aws/lambda/python:3.11` is Amazon Linux 2, glibc
+   2.26. xgboost publishes linux wheels as `manylinux_2_28` only — 3.2.0 and every later
+   release — so there is no installable wheel: the build falls back to the sdist and dies
+   on a missing cmake. numpy, scipy, sklearn and pandas are unaffected; they still ship
+   `manylinux_2_17`. Three ways out, each with a cost.
+   **Resolved (S6): `python:3.11-slim-bookworm` + `awslambdaric`.** Debian slim is glibc
+   2.36, so every locked wheel installs and xgboost 3.2.0 — the version the recorded
+   metrics were measured on — stays put. The AL2023-based 3.13 image would also have
+   worked, but drags xgboost to 3.4.1 and numpy to 2.5.2, invalidating those numbers;
+   compiling xgboost adds a C++ toolchain and ~10 minutes to every lock change. The cost
+   paid instead is wiring the runtime interface client by hand, which is four lines and
+   an AWS-documented path.
+
+7. **Image size.** The first working image came out at 2.1GB against the 700MB–1.2GB
+   budget, and cold start is this design's known weak point. 454MB of it is
+   `nvidia-nccl-cu12`, which xgboost declares on linux for distributed GPU training.
+   **Resolved (S6): filtered out of the runtime install.** CPU inference never dlopen's
+   those libraries — verified by deleting them from a built image and re-invoking, which
+   returned byte-identical `/score` and `/explain` responses. The exported requirements
+   are filtered before install, and `--no-deps` stops the resolver adding them back;
+   `uv.lock` is untouched, so the image is a deliberate *subset* of the resolution rather
+   than a different one. Result: **1.28GB**, and 326MB less downloaded per build.
 
 ## Verification
 

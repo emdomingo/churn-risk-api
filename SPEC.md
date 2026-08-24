@@ -88,6 +88,13 @@ Endpoints:
 
 - **Container image Lambda** (not zip) — model + SHAP + deps exceed the zip limit comfortably, and it makes the CI/CD cleaner.
 - Base: AWS Lambda Python base image. Multi-stage Dockerfile to keep image lean.
+  **Amended (S6):** the base is `python:3.11-slim-bookworm` plus the `awslambdaric`
+  runtime interface client, not `public.ecr.aws/lambda/python:3.11`. That image is
+  Amazon Linux 2 (glibc 2.26) and xgboost ships linux wheels as `manylinux_2_28`
+  only, so no release of it has an installable wheel there. The alternatives were
+  compiling xgboost on every build, or moving to the AL2023 3.13 image and taking
+  xgboost 3.4.1, which would invalidate the recorded metrics. Multi-stage still
+  holds, and `python -m awslambdaric` replaces what the AWS base provided.
 - Infra as code: prefer **AWS SAM** (`template.yaml`) or Terraform — pick one, document why. SAM is lighter for a single Lambda + HTTP API.
 - Resources: one Lambda (container), one HTTP API Gateway, one ECR repo. Free-tier conscious — note expected cost (~$0).
 - Config via Lambda env vars: `MODEL_VERSION`, `ANTHROPIC_API_KEY`, `LOG_LEVEL`.

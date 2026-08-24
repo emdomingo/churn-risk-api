@@ -57,7 +57,13 @@ uv run pytest tests/test_data.py::test_x   # single test
 uv run ruff check .                        # lint
 uv run --group train python -m churn.train # train, calibrate, fit SHAP, write artifacts/
 uv run uvicorn churn.api:app --reload      # serve locally
+docker build -t churn:local .              # trains in stage 1; ~1.28GB image
 ```
+
+The container is exercised through the Lambda Runtime Interface Emulator, mounted from
+the host rather than baked into the image — the Dockerfile's closing comment carries the
+`docker run` line. Note that `docker.exe` is not on PATH in this environment; it lives in
+`$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin`.
 
 Dependency groups: default = Lambda runtime, `train` = training-only (`matplotlib`),
 `dev` = tooling. Adding a runtime dep grows the Lambda image, so put it in a group
@@ -98,9 +104,15 @@ init phase.
 - **The training CSV *is* committed** (~1 MB in `data/`), a deliberate exception to
   `SPEC.md` §11. It makes the Docker build hermetic and keeps an external host off the
   deploy path. Do not "fix" this by adding a fetch step.
-- **The image is large** (~700MB–1.2GB) because `shap`, `xgboost`, `sklearn`, and
-  `pandas` are all genuinely needed at inference. That is the main cold-start driver;
-  the function is sized at 1536MB partly to compensate.
+- **The image is large** (1.28GB) because `shap`, `xgboost`, `sklearn`, and `pandas` are
+  all genuinely needed at inference. That is the main cold-start driver; the function is
+  sized at 1536MB partly to compensate. It would be 2.1GB but for the `nvidia-` filter in
+  the Dockerfile — see the S6 gates in `PLAN.md`.
+- **The base image is `python:3.11-slim-bookworm`, not the AWS Lambda base.** The AWS
+  Python 3.11 image is Amazon Linux 2 (glibc 2.26) and xgboost ships linux wheels as
+  `manylinux_2_28` only, so nothing installs there without compiling. `awslambdaric` is
+  wired in by hand as a consequence, and is a runtime dependency scoped to
+  `sys_platform == 'linux'` so local Windows syncs skip it.
 - **`/recommend` must never 500.** If the LLM call fails, return score + drivers with
   `action: null` and a reason. The LLM sees only risk band, top-3 drivers, and the action
   catalogue — it selects and justifies, it never invents actions or customer facts.
@@ -108,25 +120,31 @@ init phase.
 
 ## Current state
 
-**S0–S3 complete, uncommitted beyond the initial scaffold commit.** 77 tests green,
-ruff clean.
+**S0–S6 complete.** 142 tests green, ruff clean. S4 and S5 are committed as
+`feat(contracts)` and `feat(api)`; S6 is the container work described below.
 
 Built so far: `src/churn/data.py` (`load_raw` / `clean` / `split`), the committed
 `data/Telco-Customer-Churn.csv`, a 200-row fixture at `tests/fixtures/telco_sample.csv`
 regenerable via `scripts/make_fixture.py`, `exploration.ipynb` (the pre-registered
 univariate prior S2's SHAP output is checked against), the S2 model path — `features.py`
 (one `ColumnTransformer`), `train.py` (train → calibrate → SHAP → persist → report),
-`artifact.py` (single joblib, version-stamped) — and the S3 inference core: `scoring.py`
-and `explain.py`.
+`artifact.py` (single joblib, version-stamped) — the S3 inference core (`scoring.py`,
+`explain.py`), the S4 edge (`schemas.py`, `config.py`, `logging_setup.py`, `api.py`), the
+S5 agent (`actions.py`, `recommend.py`), and the S6 container (`Dockerfile`,
+`lambda_handler.py`, `.env.example`, `.dockerignore`).
 
-**All five decision gates are resolved**; `PLAN.md` carries each one with its reasoning.
-`TotalCharges` blanks filled with 0.0 and `SeniorCitizen` normalised in `clean` (S1);
-confusion-matrix threshold derived from `MISSED_CHURNER_COST_RATIO = 5.0` rather than
-picked (S2); level-specific driver names and the risk bands below (S3).
+**Seven decision gates are resolved**; `PLAN.md` carries each with its reasoning — the
+original five from S1–S3, plus the S6 pair (base image, image size). `TotalCharges`
+blanks filled with 0.0 and `SeniorCitizen` normalised in `clean` (S1); confusion-matrix
+threshold derived from `MISSED_CHURNER_COST_RATIO = 5.0` rather than picked (S2);
+level-specific driver names and the risk bands below (S3); `MAX_BATCH_SIZE = 1000`
+measured rather than guessed (S4); LLM model, timeout and retries set in `recommend.py`
+against the 30s function budget (S5).
 
 Current test metrics (seed 42): ROC-AUC 0.833, PR-AUC 0.638, Brier 0.141 (uncalibrated
 0.168), against a tenure-only floor of 0.734. The SHAP top-10 matches the notebook's
-prior and contains none of `gender` / `PhoneService` / `MultipleLines`.
+prior and contains none of `gender` / `PhoneService` / `MultipleLines`. The in-image
+training run reproduces the same top-10.
 
 S2 decisions worth knowing before touching `train.py`:
 
@@ -168,6 +186,20 @@ S3 decisions worth knowing before touching `scoring.py` / `explain.py`:
   row 0. `Score` and `Driver` are frozen dataclasses shaped to map onto S4's Pydantic
   response models with no translation layer.
 
-S4 (contracts + API: `schemas.py`, `config.py`, `logging_setup.py`, `api.py`) is next.
-`tests/conftest.py` builds a real artifact from the fixture at session scope via
-`build_artifact`; every new test module extends it rather than creating its own.
+S6 decisions worth knowing before touching the `Dockerfile`:
+
+- **`--no-deps` is load-bearing.** The runtime install filters `nvidia-` records out of
+  the exported requirements; without `--no-deps` the installer re-resolves xgboost's
+  dependency list and puts them straight back. The export is already the full closure.
+- **The src layout is preserved inside `/var/task`.** `ARTIFACT_PATH` resolves relative
+  to the package file, so `/var/task/src/churn/…` puts the model at `/var/task/artifacts`
+  with no env override, and the container and a checkout agree on where it lives.
+- **`lifespan="off"` in `lambda_handler.py`.** Lambda has no server lifecycle; the
+  artifact warm-up is an import-time side effect in `api.py`, so it lands in the init
+  phase. `tests/test_lambda_handler.py` asserts both halves in a subprocess, because
+  import side effects happen once per interpreter and the test session has long since
+  imported `churn.api`.
+
+**S7 (bootstrap infra: GitHub OIDC provider, deploy role, ECR repo) is next**, followed
+by S8's SAM template. Both raise gates of their own — Lambda memory and timeout, log
+retention, and the trust policy's branch scoping.

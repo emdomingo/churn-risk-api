@@ -1,0 +1,19 @@
+# Keep the build context small and the image hermetic. `data/` is deliberately NOT here:
+# the training CSV is the build's input.
+.venv/
+.git/
+.github/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.aws-sam/
+artifacts/
+tests/
+notebooks/
+*.ipynb
+.env
+htmlcov/
+.coverage
+*.md
+!README.md
