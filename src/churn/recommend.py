@@ -22,7 +22,7 @@ correct, and it is guarded by a `reason` that says which branch was taken.
 
 **Gate: model, timeout and retries.** All three are set here rather than in `config`
 because they are engineering limits, not deployment knobs -- see the constants for the
-arithmetic against the 30s Lambda budget.
+arithmetic against the 29s Lambda budget.
 """
 
 import logging
@@ -43,16 +43,16 @@ logger = logging.getLogger("churn.recommend")
 # catalogue actions escape, every cited driver was supplied -- is enforced by `_validate`
 # rather than by the model's judgement. What the larger model buys is the quality of the
 # *rationale*, which is the part a human reads. Latency is the constraint that bounds the
-# choice: this call sits inside a 30s Lambda budget behind a cold start.
+# choice: this call sits inside a 29s Lambda budget behind a cold start.
 MODEL = "claude-sonnet-5"
 
-# Gate: LLM timeout and retries, resolved (S5). The Lambda is sized at 30s. Scoring and
-# explaining one customer costs ~50ms warm, so effectively the whole budget belongs to
-# this call. The SDK retries timeouts, so worst-case wall clock is
-# `TIMEOUT_SECONDS * (MAX_RETRIES + 1)` = 16s, which leaves ~14s of headroom for a cold
-# start on a ~1GB image. The SDK's own defaults (600s timeout, 2 retries) would blow the
-# function timeout and turn a slow LLM into a 502 from API Gateway rather than the
-# graceful degradation below.
+# Gate: LLM timeout and retries, resolved (S5). The Lambda budget is 29s -- API Gateway's
+# HTTP API ceiling, adopted as the function timeout in S8. Scoring and explaining one
+# customer costs ~50ms warm, so effectively the whole budget belongs to this call. The SDK
+# retries timeouts, so worst-case wall clock is `TIMEOUT_SECONDS * (MAX_RETRIES + 1)` =
+# 16s, which leaves ~13s for a measured ~6s cold-start init. The SDK's own defaults
+# (600s timeout, 2 retries) would blow the function timeout and turn a slow LLM into a
+# 502 from API Gateway rather than the graceful degradation below.
 TIMEOUT_SECONDS = 8.0
 MAX_RETRIES = 1
 

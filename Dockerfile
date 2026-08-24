@@ -85,7 +85,7 @@ WORKDIR ${LAMBDA_TASK_ROOT}
 COPY pyproject.toml uv.lock ./
 RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt \
     && awk '/^[^[:space:]]/ { skip = ($0 ~ /^nvidia-/) } !skip' /tmp/requirements.txt > /tmp/requirements.cpu.txt \
-    && uv pip install --system --no-cache --no-deps -r /tmp/requirements.cpu.txt \
+    && uv pip install --system --no-cache --no-deps --compile-bytecode -r /tmp/requirements.cpu.txt \
     && rm -f /tmp/requirements.txt /tmp/requirements.cpu.txt pyproject.toml uv.lock /bin/uv
 
 # The repo's src layout is preserved inside the task root, so `artifact.ARTIFACT_PATH` --
@@ -94,6 +94,22 @@ RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt -o /
 COPY src/ ${LAMBDA_TASK_ROOT}/src/
 COPY --from=trainer /build/artifacts/model.joblib ${LAMBDA_TASK_ROOT}/artifacts/model.joblib
 
+# Compile our own source too. Between this and `--compile-bytecode` above, every module
+# the function imports has a `.pyc` beside it before the image is ever pulled.
+RUN python -m compileall -q ${LAMBDA_TASK_ROOT}/src
+
+# **Precompiled bytecode is a cold-start decision, measured (S8).** A Lambda filesystem is
+# read-only, so Python can never cache bytecode at runtime: with no `.pyc` in the image,
+# every cold start recompiles pandas, sklearn, shap and xgboost from source, and pays it
+# again on the next one. Measured in this image: 8.53s to import with no cache against
+# 2.40s with one. On Lambda, where image layers are streamed on first touch, the uncached
+# path overran the 10s init limit outright and the first deploy answered 503.
+#
+# The cost is ~150MB of `.pyc`. That is the right side of the trade: bytecode is faulted
+# in lazily like everything else, and only for modules actually imported.
+#
+# PYTHONDONTWRITEBYTECODE stays set precisely *because* everything is compiled already --
+# it stops the interpreter attempting writes the read-only filesystem would refuse.
 ENV PYTHONPATH=${LAMBDA_TASK_ROOT}/src \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

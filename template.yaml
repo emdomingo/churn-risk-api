@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# The application stack: one Lambda from a container image, one HTTP API in front of it,
+# one log group with a retention that is not "forever". Everything it depends on —
+# the ECR repository, the execution role, the artifact bucket — was created once by
+# infra/bootstrap.yaml and is passed in here by ARN.
+#
+# First deploy, by hand (the image must exist in ECR before this stack can reference it):
+#
+#   $repo = "033177020842.dkr.ecr.ap-southeast-2.amazonaws.com/churn-risk-api"
+#   $sha  = git rev-parse --short HEAD
+#   aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin $repo
+#   docker build -t "${repo}:${sha}" --build-arg MODEL_VERSION="0.1.0+${sha}" .
+#   docker push "${repo}:${sha}"
+#   sam deploy --stack-name churn-risk-api --region ap-southeast-2 `
+#     --s3-bucket churn-sam-artifacts-033177020842-ap-southeast-2 `
+#     --capabilities CAPABILITY_IAM `
+#     --parameter-overrides ImageUri="${repo}:${sha}" ExecutionRoleArn=arn:aws:iam::033177020842:role/churn-lambda-exec AnthropicApiKey=$env:ANTHROPIC_API_KEY
+#
+# CAPABILITY_IAM covers the Lambda invoke permission SAM attaches for API Gateway. No
+# named IAM resources are created here — the execution role already exists, which is what
+# lets the deploy role hold iam:PassRole and nothing else.
+
+Description: >
+  Churn risk scoring service: container-image Lambda behind an HTTP API, with SHAP
+  explanations and an LLM-drafted retention action.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI including tag. Tags are commit SHAs because the repository is
+      IMMUTABLE — pushing over an existing tag is refused, so the tag deployed here always
+      identifies exactly one build.
+
+  ExecutionRoleArn:
+    Type: String
+    Description: >
+      The function's role, created in infra/bootstrap.yaml. Passed in rather than declared
+      because a CI role able to create roles could escalate to anything; this way the
+      deploy role's only IAM permission is PassRole onto this ARN.
+
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Key for /recommend. Empty is a supported state: api.get_llm_client returns None and
+      the route degrades to action: null with a reason, exactly as it does when the API is
+      down. NoEcho keeps it out of console and CLI output.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: INFO emits one structured JSON line per request.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: >
+      Long enough to explain something noticed last week, short enough that storage never
+      accumulates. The CloudWatch default is Never Expire, which is how a $0 project grows
+      a bill.
+
+Globals:
+  Function:
+    # Measured, not guessed: peak RSS after loading the artifact is 283 MiB, so this is not
+    # about memory headroom at all. Lambda scales vCPU with memory and reaches one full
+    # vCPU at 1769MB; the ~6s init is single-threaded import work (pandas, sklearn,
+    # xgboost, shap) plus the joblib load, so anything less stretches it proportionally.
+    # An init over 10s is suppressed and re-run inside the invocation, which turns a slow
+    # cold start into a much slower one — that cliff is what this number buys distance
+    # from, and duration billing means faster-and-bigger costs about the same as
+    # slower-and-smaller.
+    MemorySize: 1769
+
+    # API Gateway HTTP API integrations time out at 29s no matter what Lambda permits, so
+    # matching it makes the two limits one number. recommend.py budgets against this:
+    # TIMEOUT_SECONDS 8.0 with MAX_RETRIES 1 is a 16s worst case for the LLM, leaving room
+    # for a ~6s init and still finishing inside the window.
+    Timeout: 29
+
+    Architectures:
+      - x86_64
+
+Resources:
+  ScoringFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Explicit, so the log group name below is predictable and so the deploy role's
+      # resource scoping (function:churn-risk-api-*) actually matches.
+      FunctionName: !Sub "${AWS::StackName}-scoring"
+      Description: Calibrated churn probability, SHAP drivers, and a retention action.
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      Role: !Ref ExecutionRoleArn
+      ImageConfig:
+        # The Dockerfile's CMD already names this. Repeating it here means the deployed
+        # handler is visible in the template rather than only inside the image.
+        Command:
+          - churn.lambda_handler.handler
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          # MODEL_VERSION is deliberately absent. It is consumed at *training* time and
+          # stamped into the artifact, and that stamp is what every response reports.
+          # Setting it here would create a second source of truth that could disagree with
+          # the model actually doing the scoring — see the config.py module docstring.
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Events:
+        # One catch-all route. FastAPI owns the routing table; duplicating it in API
+        # Gateway would mean two places to edit every time a route changes, and the
+        # request path this project has to explain is "API Gateway hands the whole request
+        # to Mangum", not "API Gateway dispatches".
+        ApiRoutes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        ApiRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # $default deploys to the API's root URL with no stage segment in the path, so
+      # /health is /health rather than /Prod/health.
+      StageName: $default
+      # The URL is public and unauthenticated, which SPEC asks for -- a demo anyone can
+      # curl is the point. What it must not be is an uncapped way to spend Anthropic
+      # credits, so every route is rate limited at the stage. A human demonstrating the
+      # service never notices 5 rps; a loop hammering /recommend gets 429s from API
+      # Gateway before the function is ever invoked, so throttled requests cost nothing
+      # in Lambda time or LLM tokens. This bounds the damage rather than preventing
+      # access, which is the right trade for a portfolio endpoint.
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 5
+        ThrottlingBurstLimit: 10
+
+      # SAM would otherwise generate a stage with access logging off; this keeps the
+      # request record in the same place as the application's own JSON lines.
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency_ms":"$context.responseLatency","integrationStatus":"$context.integrationStatus"}
+
+  # Declared explicitly rather than left to Lambda's implicit creation, which would default
+  # to Never Expire. Naming it after the function keeps the conventional path so nothing
+  # has to be told where to look.
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-scoring"
+      RetentionInDays: !Ref LogRetentionDays
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/http-api/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  ApiUrl:
+    Description: Base URL. Append /health, /score, /explain or /recommend.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+
+  FunctionName:
+    Description: For aws logs tail and manual invokes.
+    Value: !Ref ScoringFunction
+
+  LogGroupName:
+    Description: Where the structured JSON lines land.
+    Value: !Ref LogGroup
