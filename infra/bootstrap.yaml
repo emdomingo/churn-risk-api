@@ -1,0 +1,376 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# One-time bootstrap, deployed BY HAND with admin credentials. Everything here is the
+# ground the pipeline stands on, which is why it cannot be created by the pipeline: the
+# role that `deploy.yml` assumes is defined in this file, so something with more authority
+# has to exist first. That is the chicken-and-egg step PLAN.md warns about.
+#
+#   aws cloudformation deploy `
+#     --template-file infra/bootstrap.yaml `
+#     --stack-name churn-bootstrap `
+#     --region ap-southeast-2 `
+#     --capabilities CAPABILITY_NAMED_IAM
+#
+# (Backtick is the PowerShell continuation character; a backslash would be passed through
+# as a literal argument. See CLAUDE.md.)
+#
+# CAPABILITY_NAMED_IAM is required because the roles below are given explicit names. They
+# are named on purpose: the deploy role's ARN goes into a GitHub variable, and a generated
+# name would change on every stack replacement.
+#
+# **If this stack fails with "provider already exists"**, the account already has a GitHub
+# OIDC provider — an account can hold only one per issuer URL. Delete the orphan, or drop
+# `GitHubOidcProvider` from this template and point `DeployRole`'s trust policy at the
+# existing ARN. Do not create a second one; it is not possible.
+
+Description: >
+  Bootstrap for the churn-risk-api deploy pipeline: GitHub OIDC federation, a deploy role
+  scoped to one repo and one branch, the ECR repository, the Lambda execution role, and
+  the SAM artifact bucket. Deployed once, by hand, before any workflow can run.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: emdomingo
+    Description: GitHub account that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: churn-risk-api
+    Description: >
+      Repository name. This is half of the OIDC subject claim, so renaming the repo on
+      GitHub breaks the trust policy and requires redeploying this stack.
+
+  DeployBranch:
+    Type: String
+    Default: main
+    Description: >
+      The only branch whose workflow runs may assume the deploy role. A pull request from
+      a fork gets a different subject claim and is refused by STS, which is the property
+      that makes public repositories safe to deploy from.
+
+  AppStackName:
+    Type: String
+    Default: churn-risk-api
+    Description: >
+      Name of the application stack that S8's template.yaml deploys. Used here only to
+      scope the deploy role's permissions to resources belonging to that stack.
+
+  EcrRepositoryName:
+    Type: String
+    Default: churn-risk-api
+    Description: Name of the ECR repository holding the Lambda container image.
+
+  ImagesToKeep:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: >
+      How many images the ECR lifecycle policy retains. Each is roughly 350MB stored, and
+      the private-repo free tier is 500MB/month for the first 12 months.
+
+Resources:
+  # ------------------------------------------------------------------ identity ------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # Since mid-2023 IAM validates this endpoint against its own trust store and ignores
+      # the thumbprint, but the API still wants the field populated. This is GitHub's
+      # published intermediate thumbprint; if it ever rotates, nothing here breaks.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  # The role GitHub Actions assumes. No long-lived access keys exist anywhere in this
+  # design: the workflow presents a short-lived OIDC token, STS checks the claims below,
+  # and hands back credentials that expire within the hour.
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: churn-github-deploy
+      Description: Assumed by GitHub Actions on pushes to the deploy branch.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # Both conditions matter. Without the audience check the token could have
+                # been minted for a different relying party; without the exact subject —
+                # note StringEquals, never StringLike with a wildcard — any repository on
+                # GitHub could assume this role.
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DeployBranch}"
+      Policies:
+        - PolicyName: churn-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # -- ECR ------------------------------------------------------------
+              # The auth token is account-wide by definition; it cannot be scoped to a
+              # repository. Everything that touches image data is scoped below.
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+
+              - Sid: EcrPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:ListImages
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt EcrRepository.Arn
+
+              # -- CloudFormation --------------------------------------------------
+              # Scoped to the application stack. The deploy role cannot read, change or
+              # delete any other stack in the account — including this bootstrap stack,
+              # which is deliberate: CI must not be able to rewrite its own trust policy.
+              - Sid: CloudFormationAppStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:UpdateStack
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+
+              # SAM templates are expanded by a CloudFormation macro, and creating a
+              # change set against a transform requires permission on the transform's own
+              # pseudo-ARN. Missing this is the classic "sam deploy works locally, fails
+              # in CI" error.
+              - Sid: CloudFormationServerlessTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+              # Template validation and summarising take no resource.
+              - Sid: CloudFormationValidate
+                Effect: Allow
+                Action:
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+
+              # -- Lambda ----------------------------------------------------------
+              # SAM names functions <stack>-<LogicalId>-<suffix>, so the stack name prefix
+              # is what bounds this.
+              - Sid: LambdaFunction
+                Effect: Allow
+                Action:
+                  - lambda:AddPermission
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetPolicy
+                  - lambda:ListTags
+                  - lambda:ListVersionsByFunction
+                  - lambda:PublishVersion
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*"
+
+              # -- API Gateway -----------------------------------------------------
+              # HTTP APIs are managed through control-plane paths rather than named
+              # resources, so the ARNs are path shaped.
+              - Sid: ApiGatewayHttpApi
+                Effect: Allow
+                Action:
+                  - apigateway:DELETE
+                  - apigateway:GET
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:PUT
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*"
+
+              # -- Logs ------------------------------------------------------------
+              # S8's template declares the log group explicitly so retention is set rather
+              # than left to the never-expiring default.
+              - Sid: CloudWatchLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DeleteRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsForResource
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*:log-stream:*"
+
+              # -- Artifacts -------------------------------------------------------
+              - Sid: SamArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+
+              - Sid: SamArtifactsBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+
+              # -- PassRole --------------------------------------------------------
+              # The single most important line here. The deploy role has NO IAM write
+              # permissions: it cannot create roles, attach policies, or escalate itself.
+              # It may only hand the one pre-made execution role to Lambda, and the
+              # condition means it cannot hand that role to any other service either.
+              - Sid: PassExecutionRoleToLambda
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt LambdaExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+
+  # ------------------------------------------------------------------ runtime -------
+  # The function's own role, created here rather than in S8's template. Keeping it in the
+  # bootstrap is what lets the deploy role hold zero IAM write permissions: if CI created
+  # the execution role it would need iam:CreateRole and iam:AttachRolePolicy, and a role
+  # that can mint roles can grant itself anything. The execution role changes about never,
+  # so the cost of moving it out of the app stack is close to zero.
+  #
+  # S8's template.yaml takes this ARN as a parameter and sets `Role:` on the function.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: churn-lambda-exec
+      Description: Execution role for the churn scoring Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Writing its own logs is genuinely all this function does against AWS. It reads no
+      # buckets, calls no other services, and reaches the Anthropic API over the public
+      # internet with a key from an environment variable.
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    # The images are rebuildable from any commit, but a stack delete that silently took
+    # the running function's image with it would be a bad afternoon.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      # Tags are commit SHAs, so a tag should never point at two different images.
+      # Immutability turns "which build is live?" from a question into a fact.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after a day. These are layers orphaned by a re-push, not history worth keeping.",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the most recent images only. Each is ~350MB stored.",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ImagesToKeep}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # `sam deploy` uploads the expanded template here. Giving it an explicit bucket avoids
+  # `--resolve-s3`, which would create a second managed CloudFormation stack from CI and
+  # therefore need stack permissions beyond the application's own.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "churn-sam-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+          # Templates are a few KB and only the newest matters, but an unbounded bucket is
+          # how a $0 project quietly becomes a $2 one.
+          - Id: expire-old-templates
+            Status: Enabled
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+Outputs:
+  DeployRoleArn:
+    Description: >
+      Set this as the GitHub Actions variable AWS_DEPLOY_ROLE_ARN. The workflow needs
+      `permissions: id-token: write` to request the OIDC token that assumes it.
+    Value: !GetAtt DeployRole.Arn
+
+  EcrRepositoryUri:
+    Description: Push target for the container image; also the base of the image URI S8 deploys.
+    Value: !GetAtt EcrRepository.RepositoryUri
+
+  LambdaExecutionRoleArn:
+    Description: Pass to S8's template.yaml so the function does not create its own role.
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  ArtifactBucketName:
+    Description: Pass to `sam deploy --s3-bucket`.
+    Value: !Ref ArtifactBucket
