@@ -77,6 +77,11 @@ curl.exe -s $API/health
 {"status":"ok","model_version":"0.1.0+3f5fb64"}
 ```
 
+> Responses on this page are real, captured from the live service at build `0.1.0+3f5fb64`.
+> `model_version` is the short SHA of the commit whose image is serving, so the value you
+> get back will be whatever has been deployed since — that it moves on every merge is the
+> point of it.
+
 ### `POST /score`
 
 List in, list out, in request order — always, even for one customer. One `transform` and
