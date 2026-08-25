@@ -210,10 +210,14 @@ S7/S8 decisions worth knowing before touching `infra/bootstrap.yaml` or `templat
   `bootstrap.yaml` rather than in `template.yaml`: creating it from CI would need
   `iam:CreateRole` and `iam:AttachRolePolicy`, and a role that can mint roles can escalate
   to anything. `template.yaml` takes the ARN as a parameter and creates no IAM at all.
-- **OIDC trust is `StringEquals` on the full subject**,
-  `repo:emdomingo/churn-risk-api:ref:refs/heads/main`. Forks and pull requests present a
-  different `sub` and are refused by STS, which is what makes the public repo safe to
-  deploy from. Renaming the repo breaks it and requires redeploying the bootstrap stack.
+- **OIDC trust is `StringEquals` on the full subject**, and the subject carries **numeric
+  IDs, not just names**: `repo:emdomingo@108572192/churn-risk-api@1344827975:ref:refs/heads/main`.
+  Forks and pull requests present a different `sub` and are refused by STS, which is what
+  makes the public repo safe to deploy from. A name-only policy fails closed and STS says
+  only "Not authorized to perform sts:AssumeRoleWithWebIdentity" — CloudTrail's `userName`
+  on the failed `AssumeRoleWithWebIdentity` event is where the real subject is legible.
+  Because the IDs are immutable, renaming the repo no longer breaks the trust. See gate 13
+  in `PLAN.md`.
 - **ECR is IMMUTABLE and tags are commit SHAs.** A re-push of the same SHA is refused, so
   fixing a bad image means deleting the tag first. Lifecycle keeps the last 3.
 - **`--provenance=false --sbom=false` is mandatory on every build.** Default buildx pushes

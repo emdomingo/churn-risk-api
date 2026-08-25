@@ -382,6 +382,26 @@ test hittable against the live URL.
     rather than a pipeline failure. Corollary, deliberate: because the parameter is passed
     every time, deploying with the secret removed *clears* the live key.
 
+13. **The OIDC subject claim carries numeric IDs.** The first merge to `main` failed at
+    the earliest step — `Not authorized to perform sts:AssumeRoleWithWebIdentity` — with
+    nothing built and nothing deployed. CloudTrail's `userName` on the failed event showed
+    the token's actual subject,
+    `repo:emdomingo@108572192/churn-risk-api@1344827975:ref:refs/heads/main`, against a
+    policy written as `repo:emdomingo/churn-risk-api:ref:refs/heads/main`. GitHub mints the
+    claim with immutable owner and repo IDs appended to the names. → S9.
+    **Resolved (S9): the trust policy matches the ID-based subject.** `GitHubOwnerId` and
+    `GitHubRepoId` are now parameters of `infra/bootstrap.yaml` and the `sub` condition is
+    built from all four. The alternative — turning the ID-based claim off in the
+    repository's Actions settings to restore the legacy subject — was rejected: it trades a
+    fact recorded in version control for a setting invisible to anyone reading the code,
+    the same class of hidden dependency as `AWS_DEPLOY_ROLE_ARN`, and it opts out of the
+    more robust default. `StringEquals` and the one-repo-one-branch property are unchanged,
+    so the security posture is identical. The change also retires the caveat this file
+    previously carried: because IDs do not change, **renaming the repository no longer
+    breaks the trust policy**, which is exactly what the ID-based claim exists for. Note
+    the diagnostic too — the error names no claim, so read the real subject from CloudTrail
+    rather than guessing at the policy.
+
 ## Verification
 
 - **Per scaffold:** `uv run pytest` green, `uv run ruff check` clean.

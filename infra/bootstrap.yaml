@@ -38,8 +38,26 @@ Parameters:
     Type: String
     Default: churn-risk-api
     Description: >
-      Repository name. This is half of the OIDC subject claim, so renaming the repo on
-      GitHub breaks the trust policy and requires redeploying this stack.
+      Repository name. Half of the OIDC subject claim, but paired with GitHubRepoId below
+      it is the *readable* half only -- the numeric ID is what actually pins the identity,
+      so renaming the repo no longer breaks the trust policy.
+
+  GitHubOwnerId:
+    Type: String
+    Default: "108572192"
+    Description: >
+      Numeric account ID for GitHubOwner. GitHub mints the OIDC subject claim with the
+      immutable IDs appended to the names -- `repo:owner@<ownerId>/repo@<repoId>:ref:...`
+      -- so the trust policy has to carry them or STS refuses with a bare
+      "Not authorized to perform sts:AssumeRoleWithWebIdentity". Read from CloudTrail on
+      the first failed assume; `gh api /users/<owner> --jq .id` also returns it.
+
+  GitHubRepoId:
+    Type: String
+    Default: "1344827975"
+    Description: >
+      Numeric repository ID for GitHubRepo. `gh api /repos/<owner>/<repo> --jq .id`.
+      This is the value that makes the trust survive a rename: names change, IDs do not.
 
   DeployBranch:
     Type: String
@@ -105,8 +123,17 @@ Resources:
                 # been minted for a different relying party; without the exact subject —
                 # note StringEquals, never StringLike with a wildcard — any repository on
                 # GitHub could assume this role.
+                #
+                # **The subject carries numeric IDs, not just names.** GitHub mints the
+                # claim as `repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/<branch>`.
+                # A policy written with names alone fails closed, and the only error STS
+                # returns is "Not authorized to perform sts:AssumeRoleWithWebIdentity" with
+                # no mention of which claim mismatched — CloudTrail's `userName` field on
+                # the failed event is where the actual subject can be read. The IDs are
+                # also what make this survive a repository rename, which the name-only
+                # form did not.
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DeployBranch}"
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${DeployBranch}"
       Policies:
         - PolicyName: churn-deploy
           PolicyDocument:
