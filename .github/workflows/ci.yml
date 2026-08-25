@@ -1,0 +1,146 @@
+name: CI
+
+# Lint, tests, and — conditionally — the container build.
+#
+# **Runs with no AWS and no network access to anything but PyPI.** The suite never loads a
+# prebuilt model: `tests/conftest.py` trains a tiny one on the committed 200-row fixture at
+# session scope. That is what makes this job cheap enough to run on every pull request.
+#
+# **`workflow_call` is why this file exists separately from `deploy.yml`.** GitHub cannot
+# express "job in workflow B needs a job in workflow A" — `workflow_run` fires *after* the
+# fact and cannot gate anything. So `deploy.yml` calls this workflow as a job and hangs its
+# deploy off `needs:`, which makes "a merge deploys only if CI is green" literally true
+# rather than a convention.
+#
+# **The image build is path-filtered (S9 gate).** Never building it means `main` breaks at
+# deploy time, which is the one failure that costs a live URL. Building it always taxes
+# every README pull request with a multi-minute build for no signal. The break surface —
+# the `nvidia-` filter, `--no-deps`, the Debian base-image choice — only moves when the
+# Dockerfile, the lock, the project metadata, or the build context changes, so those four
+# paths are the filter.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      build_image:
+        description: >
+          Set false when the caller builds the image itself. `deploy.yml` does, and building
+          it twice for one commit would double the slowest step in the pipeline.
+        type: boolean
+        default: true
+
+# A force-push onto a pull request should cancel the run it superseded rather than race it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Matches `requires-python` and the Dockerfile's PYTHON_VERSION. Three places now name
+  # 3.11; the artifact is a joblib pickle, so trainer and reader disagreeing on the
+  # interpreter is a real failure mode, not a style question.
+  PYTHON_VERSION: "3.11"
+  # The uv that wrote `uv.lock`, same pin as the Dockerfile. `--frozen` then means the same
+  # resolver reads the lock rather than merely a compatible one.
+  UV_VERSION: "0.11.1"
+
+jobs:
+  lint-and-test:
+    name: ruff + pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install the project
+        # --frozen fails the job if `uv.lock` is stale against `pyproject.toml`, which is a
+        # bug worth catching here rather than at image build time.
+        run: uv sync --all-groups --frozen --python ${{ env.PYTHON_VERSION }}
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Tests
+        run: uv run --frozen pytest -q
+
+  changes:
+    name: does this commit touch the image?
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Two commits is enough for a pull request diff; the merge commit and its parent.
+          fetch-depth: 0
+
+      - name: Diff against the base
+        id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch, or a first push with no `before`, has nothing to diff
+          # against. Build in that case: an explicit manual run is a request for the
+          # expensive path, and an unknown base is not evidence of no change.
+          if [ -z "${BASE}" ] || [ "${BASE}" = "0000000000000000000000000000000000000000" ]; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+            echo "No usable base commit — building."
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "${BASE}" "${HEAD}")"
+          echo "Changed files:"
+          echo "${changed}"
+
+          if echo "${changed}" | grep -qE '^(Dockerfile|uv\.lock|pyproject\.toml|\.dockerignore)$'; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    name: docker build
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' && inputs.build_image != false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        # Stage 1 trains the model, so a green build here also proves the training path
+        # still runs end to end inside the image. Not pushed and not tagged with a SHA:
+        # ECR is IMMUTABLE and this is a pull request, so nothing here may claim a tag.
+        #
+        # `--provenance=false --sbom=false` is not strictly required for a local build, but
+        # it is mandatory on the push in `deploy.yml` — Lambda rejects the OCI image index
+        # buildx otherwise emits. Carrying the flags here keeps the two builds identical,
+        # so a green CI build is evidence about the artifact that actually ships.
+        run: |
+          docker build \
+            --provenance=false --sbom=false \
+            --build-arg MODEL_VERSION="0.1.0+${GITHUB_SHA::7}" \
+            -t churn:ci .
+
+      - name: The image can import its own handler
+        # A build that succeeds but produces an image that cannot import is the hole the
+        # build alone leaves open — precisely the failure the `nvidia-` filter risks if
+        # xgboost ever moves nccl onto an import-time path. Ten seconds, no RIE, no event
+        # loop: importing `churn.api` is what loads the artifact, so this also proves the
+        # model is readable by the interpreter that shipped with it.
+        run: |
+          docker run --rm --entrypoint python churn:ci \
+            -c "import churn.lambda_handler; print('handler import OK')"
