@@ -122,8 +122,9 @@ init phase.
 
 **S0–S8 complete and deployed.** 142 tests green, ruff clean. The service is live at
 `https://03bmm97sm6.execute-api.ap-southeast-2.amazonaws.com` in account 033177020842,
-serving all four routes with `model_version` `0.1.0+3a40397`. **S9 (`ci.yml` and
-`deploy.yml`) is next**, then S10's README and smoke test.
+serving all four routes with `model_version` `0.1.0+3a40397`. **S9's two workflows are
+written but not yet exercised** — no pull request or merge has run them. **S10 (README +
+smoke test) is next**, once S9 is proven by an actual PR and merge.
 
 Built so far: `src/churn/data.py` (`load_raw` / `clean` / `split`), the committed
 `data/Telco-Customer-Churn.csv`, a 200-row fixture at `tests/fixtures/telco_sample.csv`
@@ -229,7 +230,29 @@ S7/S8 decisions worth knowing before touching `infra/bootstrap.yaml` or `templat
   Gateway's 29s. Every subsequent request is 70–160ms. S10's smoke test has to tolerate
   it, and the README owes it an honest paragraph rather than a silent retry.
 
-**S9 (`ci.yml` + `deploy.yml`) is next**, then S10's README and smoke test. S9's own gates:
-whether CI runs the Docker build (slow, but it is the thing that breaks), and whether
-`deploy.yml` passes `ANTHROPIC_API_KEY` as a stack parameter on every deploy — the
-function currently runs without a key and `/recommend` degrades to `action: null`.
+S9 decisions worth knowing before touching `.github/workflows/`:
+
+- **`deploy.yml` calls `ci.yml` as a job**, via `workflow_call` with `build_image: false`.
+  GitHub cannot express "job in workflow B needs a job in workflow A" — `workflow_run`
+  fires after the fact and gates nothing — so `needs: ci` is what makes "a merge deploys
+  only if CI is green" literally true. `build_image: false` stops the same commit being
+  built twice.
+- **CI's image build is path-filtered** to `Dockerfile`, `uv.lock`, `pyproject.toml`,
+  `.dockerignore` — the whole break surface. An unknown base builds rather than skips.
+  Gate 11 in `PLAN.md`.
+- **`ANTHROPIC_API_KEY` is passed on every deploy** from a GitHub secret, reaching the
+  command through `env:` rather than YAML interpolation. The `""` default is kept, so a
+  keyless deploy still succeeds and `/recommend` degrades. Corollary: removing the secret
+  *clears* the live key on the next deploy. Gate 12 in `PLAN.md`.
+- **The deploy skips the build when the tag already exists.** ECR is IMMUTABLE, so a
+  re-run on an unchanged commit would otherwise fail at the push instead of being a no-op.
+- **The verification step retries `/health` up to 10 times**, tolerating the known 503
+  from gate 10 and waiting for `model_version` to equal `0.1.0+<short sha>`.
+
+**Two GitHub settings are required and are not in the repo:** the repository *variable*
+`AWS_DEPLOY_ROLE_ARN` (the `DeployRoleArn` output of the bootstrap stack) and the
+*secret* `ANTHROPIC_API_KEY`. Without the variable the deploy job cannot assume a role.
+
+**S9 is written but unproven** — the workflows have never run. Proving them is a PR (CI
+only, no AWS credentials touched) and a merge (deploy runs, live `model_version` changes).
+Then **S10: README and smoke test**.

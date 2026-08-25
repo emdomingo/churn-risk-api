@@ -1,0 +1,195 @@
+name: Deploy
+
+# Push to `main` -> CI -> build and push the image -> update the stack -> verify the live
+# URL is serving the commit that was just merged.
+#
+# **CI is a job here, not a separate workflow that happened to pass.** `ci.yml` exposes
+# `workflow_call`, so `needs: ci` makes "a merge deploys only if CI is green" a hard
+# dependency rather than a convention. `workflow_run` would fire after the fact and could
+# not gate anything.
+#
+# **The image is built once.** CI is called with `build_image: false` because the job below
+# builds the same commit and pushes it; building it twice would double the slowest step in
+# the pipeline for zero extra signal.
+#
+# **`aws cloudformation deploy`, not `sam deploy`.** SAM's packaging step demands
+# `--image-repository` and wants to build and push the image itself, which would bypass
+# both the SHA tagging and the provenance flags below. The image is already in ECR by the
+# time the stack is touched, so the deploy is only a stack update -- CloudFormation applies
+# the SAM transform server-side, which is what the `Serverless-2016-10-31` grant in
+# infra/bootstrap.yaml pays for.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never cancel a deploy in flight: a half-applied CloudFormation update is worse than a
+# queued one. `cancel-in-progress: false` is the whole point of naming this group.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required to request the OIDC token that assumes the deploy role. Without it the
+  # `configure-aws-credentials` step fails with a message that does not mention this line.
+  id-token: write
+
+env:
+  AWS_REGION: ap-southeast-2
+  STACK_NAME: churn-risk-api
+  ECR_REPOSITORY: churn-risk-api
+  # Both created by infra/bootstrap.yaml and read from its stack outputs. Not secrets: the
+  # account ID already appears in template.yaml, and an ARN grants nothing without the OIDC
+  # trust policy, which is pinned to this repo and this branch.
+  EXECUTION_ROLE_ARN: arn:aws:iam::033177020842:role/churn-lambda-exec
+  ARTIFACT_BUCKET: churn-sam-artifacts-033177020842-ap-southeast-2
+
+jobs:
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+    with:
+      build_image: false
+
+  deploy:
+    name: build, push, deploy
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: churn-deploy-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve the image tag
+        id: tag
+        # Seven characters, matching the MODEL_VERSION stamp already live (0.1.0+3a40397)
+        # and the short SHA in template.yaml's manual-deploy comment. Three places name the
+        # same thing; they have to agree or `model_version` stops identifying the build.
+        #
+        # ECR is IMMUTABLE, so re-pushing an existing tag is refused by the registry. That
+        # is a feature -- one tag is always exactly one build -- but it makes a re-run of
+        # this workflow on an unchanged commit fail at the push rather than being a no-op.
+        # So look first: if the tag is already there, the image is already correct and only
+        # the stack update needs to run.
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA::7}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPOSITORY}:${sha}" >> "$GITHUB_OUTPUT"
+
+          if aws ecr describe-images \
+               --repository-name "${ECR_REPOSITORY}" \
+               --image-ids "imageTag=${sha}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${sha} is already in ECR -- skipping the build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.tag.outputs.exists == 'false'
+
+      - name: Build and push
+        if: steps.tag.outputs.exists == 'false'
+        # `--provenance=false --sbom=false` is mandatory, not hygiene. Default buildx pushes
+        # an OCI *image index* carrying an `unknown/unknown` attestation manifest, and
+        # Lambda rejects that outright at CreateFunction with an error that does not say
+        # why. Removing either flag breaks the deploy.
+        #
+        # Stage 1 of the Dockerfile trains the model, so this step is also the training run
+        # whose artifact ships. MODEL_VERSION is a build arg because it is stamped into that
+        # artifact at train time -- the function sets no MODEL_VERSION env var, so what the
+        # live service reports comes from here and nowhere else.
+        run: |
+          set -euo pipefail
+          docker build \
+            --provenance=false --sbom=false \
+            --build-arg MODEL_VERSION="0.1.0+${{ steps.tag.outputs.sha }}" \
+            -t "${{ steps.tag.outputs.image_uri }}" .
+          docker push "${{ steps.tag.outputs.image_uri }}"
+
+      - name: Update the stack
+        # The key is passed on every deploy, per the S9 gate in PLAN.md. It reaches the
+        # command through the environment rather than through YAML interpolation so it is
+        # never expanded into a rendered command line the runner logs.
+        #
+        # An unset secret expands to the empty string, which the template documents as a
+        # supported state: api.get_llm_client returns None and /recommend degrades to
+        # action: null with a reason. Note the corollary -- because this is passed every
+        # time, deploying with the secret removed *clears* a previously set key rather than
+        # leaving it in place. That is intended: the stack matches what the repo declares.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          aws cloudformation deploy \
+            --template-file template.yaml \
+            --stack-name "${STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --s3-bucket "${ARTIFACT_BUCKET}" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ImageUri="${{ steps.tag.outputs.image_uri }}" \
+              ExecutionRoleArn="${EXECUTION_ROLE_ARN}" \
+              AnthropicApiKey="${ANTHROPIC_API_KEY}"
+
+      - name: Read the stack outputs
+        id: stack
+        run: |
+          set -euo pipefail
+          url="$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          echo "API: ${url}"
+
+      - name: The live URL serves this commit
+        # The deploy verification step, and the reason /health reports model_version at all.
+        #
+        # **The first request after a deploy returns 503, and that is expected.** Init
+        # exceeds Lambda's 10s cap, gets suppressed, and is re-run inside the invocation;
+        # 10 + ~20.5s overruns API Gateway's 29s. Every request after it is 70-160ms. See
+        # gate 10 in PLAN.md -- this is measured and deliberately not worked around, so the
+        # check tolerates it rather than the service hiding it. Retrying here is honest
+        # because it is a cold start, not a flake: the retry is the documented behaviour.
+        env:
+          BASE_URL: ${{ steps.stack.outputs.url }}
+          WANT: 0.1.0+${{ steps.tag.outputs.sha }}
+        run: |
+          set -uo pipefail
+
+          for attempt in $(seq 1 10); do
+            code="$(curl -s -o health.json -w '%{http_code}' --max-time 35 "${BASE_URL}/health" || echo 000)"
+            body="$(cat health.json 2>/dev/null || true)"
+            echo "attempt ${attempt}: HTTP ${code} ${body}"
+
+            if [ "${code}" = "200" ]; then
+              got="$(printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["model_version"])')"
+              if [ "${got}" = "${WANT}" ]; then
+                echo "Live and serving ${got}."
+                exit 0
+              fi
+              # A 200 on the *old* version means the update has not rolled through yet.
+              echo "Serving ${got}, waiting for ${WANT}."
+            fi
+            sleep 10
+          done
+
+          echo "::error::/health never reported ${WANT}. See the cold-start note above and the function logs."
+          exit 1

@@ -353,6 +353,35 @@ test hittable against the live URL.
     concurrency (~$19–32/month) were both rejected — the first papers over the cause, the
     second ends the free-tier story.
 
+11. **Does CI build the container image?** Never building it means `main` breaks at deploy
+    time, which is the one failure that costs a live URL. Building it on every run taxes a
+    README-only pull request with a multi-minute build for no signal. → S9.
+    **Resolved (S9): path-filtered.** The `changes` job in `ci.yml` diffs against the base
+    and builds only when `Dockerfile`, `uv.lock`, `pyproject.toml`, or `.dockerignore`
+    moved — those four are the entire break surface (the `nvidia-` filter, `--no-deps`, the
+    Debian base-image choice). An unknown base (`workflow_dispatch`, a first push) builds
+    rather than skips: an explicit manual run is a request for the expensive path, and a
+    missing base is not evidence of no change. The build carries `--provenance=false
+    --sbom=false` even though a local build does not need them, so a green CI build is
+    evidence about the artifact that actually ships, and follows with an import check —
+    a build that succeeds but produces an image that cannot import is the hole the build
+    alone leaves open.
+
+12. **Does `deploy.yml` pass `ANTHROPIC_API_KEY` on every deploy?** The function currently
+    runs without a key and `/recommend` degrades to `action: null`, so the live demo
+    undersells S5. Against that, the key becomes a Lambda env var. → S9.
+    **Resolved (S9): passed, from a GitHub secret.** The exposure was checked rather than
+    assumed. `AnthropicApiKey` is already `NoEcho: true` with a `""` default, so
+    `DescribeStacks` returns `****`; the real plaintext surface is the Lambda env var via
+    `lambda:GetFunctionConfiguration`. In this account only two principals hold that — the
+    owner's admin identity, and `churn-github-deploy`, assumable only by STS on the exact
+    subject `repo:emdomingo/churn-risk-api:ref:refs/heads/main`. Secrets Manager would
+    close it properly but adds a resource, an IAM statement, and a cold-start fetch to a
+    function whose cold start is already gate 10 — `SPEC.md` §1 scope drift for a
+    rotatable key. The `""` default is kept, so a keyless deploy stays a supported state
+    rather than a pipeline failure. Corollary, deliberate: because the parameter is passed
+    every time, deploying with the secret removed *clears* the live key.
+
 ## Verification
 
 - **Per scaffold:** `uv run pytest` green, `uv run ruff check` clean.
