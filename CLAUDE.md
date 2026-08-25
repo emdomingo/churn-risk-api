@@ -106,8 +106,9 @@ init phase.
   deploy path. Do not "fix" this by adding a fetch step.
 - **The image is large** (1.28GB) because `shap`, `xgboost`, `sklearn`, and `pandas` are
   all genuinely needed at inference. That is the main cold-start driver; the function is
-  sized at 1536MB partly to compensate. It would be 2.1GB but for the `nvidia-` filter in
-  the Dockerfile — see the S6 gates in `PLAN.md`.
+  sized at **3008MB** partly to compensate — Lambda scales vCPU with memory, and 1769MB
+  was tried first and still overran the init cap (gate 8). It would be 2.1GB but for the
+  `nvidia-` filter in the Dockerfile — see the S6 gates in `PLAN.md`.
 - **The base image is `python:3.11-slim-bookworm`, not the AWS Lambda base.** The AWS
   Python 3.11 image is Amazon Linux 2 (glibc 2.26) and xgboost ships linux wheels as
   `manylinux_2_28` only, so nothing installs there without compiling. `awslambdaric` is
@@ -120,11 +121,18 @@ init phase.
 
 ## Current state
 
-**S0–S8 complete and deployed.** 142 tests green, ruff clean. The service is live at
+**S0–S10 complete.** 142 offline tests green plus 4 network smoke tests that skip without
+`CHURN_SMOKE_URL`; ruff clean. The service is live at
 `https://03bmm97sm6.execute-api.ap-southeast-2.amazonaws.com` in account 033177020842,
-serving all four routes with `model_version` `0.1.0+3a40397`. **S9's two workflows are
-written but not yet exercised** — no pull request or merge has run them. **S10 (README +
-smoke test) is next**, once S9 is proven by an actual PR and merge.
+serving all four routes with `model_version` `0.1.0+3f5fb64`.
+
+**S9 is proven end to end**: PR #1 ran CI only, the merge built, pushed, and deployed, and
+`/recommend` returns a real catalogue action — confirming `ANTHROPIC_API_KEY` reaches the
+function. The first merge failed at the OIDC step; see gate 13.
+
+**S10 is written but not yet pushed.** `README.md` and `tests/test_smoke.py` are committed
+locally and `main` is ahead of `origin`. Pushing triggers a deploy and moves
+`model_version`.
 
 Built so far: `src/churn/data.py` (`load_raw` / `clean` / `split`), the committed
 `data/Telco-Customer-Churn.csv`, a 200-row fixture at `tests/fixtures/telco_sample.csv`
