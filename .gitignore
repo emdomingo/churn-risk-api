@@ -10,6 +10,11 @@ __pycache__/
 artifacts/
 .env
 
+# Internal working docs — kept locally, not published to the public repo
+CLAUDE.md
+PLAN.md
+SPEC.md
+
 # Tooling
 .aws-sam/
 .pytest_cache/
